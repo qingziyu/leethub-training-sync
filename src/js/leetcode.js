@@ -1049,38 +1049,104 @@ LeetCodeV2.prototype.injectAndListen = function () {
  * The main function that handles the entire commit process based on the submissionId.
  */
 LeetCodeV2.prototype.processSubmission = async function (submissionId, suffix) {
-  // Set the submissionId as a global variable so the existing init function can use it.
-  window.leethubLastSubmissionId = submissionId;
+  let isCN;
+  try {
+    isCN = getLeetCodeBaseUrl() === 'https://leetcode.cn';
+  } catch (error) {
+    console.error(
+      `[LeetHub Training] processing failed unknown: ${getErrorMessage(error)}`,
+      error,
+    );
+    return;
+  }
 
-  if (getLeetCodeBaseUrl() !== 'https://leetcode.cn') {
+  if (!isCN) {
     // Keep the existing leetcode.com submission flow unchanged.
+    window.leethubLastSubmissionId = submissionId;
     loader(this);
     return;
   }
 
-  const normalizedSubmissionId = String(submissionId);
-  if (
-    this.queuedSubmissionIds.has(normalizedSubmissionId) ||
-    this.completedSubmissionIds.has(normalizedSubmissionId)
-  ) {
+  let normalizedSubmissionId = 'unknown';
+  try {
+    normalizedSubmissionId = String(submissionId);
+    window.leethubLastSubmissionId = submissionId;
+    if (
+      this.queuedSubmissionIds.has(normalizedSubmissionId) ||
+      this.completedSubmissionIds.has(normalizedSubmissionId)
+    ) {
+      return;
+    }
+
+    this.queuedSubmissionIds.add(normalizedSubmissionId);
+    console.log(`[LeetHub Training] queued submission ${normalizedSubmissionId}`);
+  } catch (error) {
+    console.error(
+      `[LeetHub Training] processing failed ${normalizedSubmissionId}: ${getErrorMessage(error)}`,
+      error,
+    );
     return;
   }
 
-  this.queuedSubmissionIds.add(normalizedSubmissionId);
-  this.submissionQueue = this.submissionQueue.then(async () => {
-    this.startSpinner();
-    try {
-      await this.processCnSubmission(normalizedSubmissionId, suffix);
-      this.completedSubmissionIds.add(normalizedSubmissionId);
-      this.markUploaded();
-    } catch (error) {
-      this.markUploadFailed();
-      console.error(`LeetHub: Failed to archive submission ${normalizedSubmissionId}`, error);
-    } finally {
-      this.queuedSubmissionIds.delete(normalizedSubmissionId);
-      uploadState.uploading = false;
-    }
+  const recoveredQueue = Promise.resolve(this.submissionQueue).catch(error => {
+    console.error(
+      `[LeetHub Training] recovered rejected queue before submission ${normalizedSubmissionId}: ${getErrorMessage(error)}`,
+      error,
+    );
   });
+
+  const cleanupSubmissionState = () => {
+    try {
+      this.queuedSubmissionIds.delete(normalizedSubmissionId);
+    } catch (error) {
+      console.error(
+        `[LeetHub Training] processing failed ${normalizedSubmissionId}: ${getErrorMessage(error)}`,
+        error,
+      );
+    }
+    try {
+      uploadState.uploading = false;
+    } catch (error) {
+      console.error(
+        `[LeetHub Training] processing failed ${normalizedSubmissionId}: ${getErrorMessage(error)}`,
+        error,
+      );
+    }
+  };
+
+  this.submissionQueue = recoveredQueue
+    .then(async () => {
+      try {
+        console.log(`[LeetHub Training] started submission ${normalizedSubmissionId}`);
+        this.startSpinner();
+        await this.processCnSubmission(normalizedSubmissionId, suffix);
+        this.completedSubmissionIds.add(normalizedSubmissionId);
+        this.markUploaded();
+      } catch (error) {
+        console.error(
+          `[LeetHub Training] processing failed ${normalizedSubmissionId}: ${getErrorMessage(error)}`,
+          error,
+        );
+        try {
+          this.markUploadFailed();
+        } catch (indicatorError) {
+          console.error(
+            `[LeetHub Training] processing failed ${normalizedSubmissionId}: ${getErrorMessage(indicatorError)}`,
+            indicatorError,
+          );
+        }
+      } finally {
+        cleanupSubmissionState();
+      }
+    })
+    .catch(error => {
+      // Last-resort guard: never retain a rejected promise as the serial queue.
+      console.error(
+        `[LeetHub Training] processing failed ${normalizedSubmissionId}: ${getErrorMessage(error)}`,
+        error,
+      );
+      cleanupSubmissionState();
+    });
 
   return this.submissionQueue;
 };
@@ -1097,6 +1163,39 @@ function LeetCodeV2() {
   this.addManualSubmitButton();
   this.injectAndListen();
 }
+
+const getErrorMessage = error => {
+  try {
+    if (error instanceof Error) {
+      return `${error.name}: ${error.message}`;
+    }
+    return String(error);
+  } catch {
+    return 'Unknown error';
+  }
+};
+
+const fetchJsonWithTimeout = async (url, options, timeoutMilliseconds = 10000) => {
+  const controller = new AbortController();
+  let didTimeout = false;
+  const timeoutId = setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, timeoutMilliseconds);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return await response.json();
+  } catch (error) {
+    if (didTimeout) {
+      throw new Error(`GraphQL request timed out after ${timeoutMilliseconds} ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
 LeetCodeV2.prototype.init = async function (submissionId = window.leethubLastSubmissionId) {
   if (!submissionId) {
     throw new Error('Could not find a recent submission ID. Please try submitting again.');
@@ -1161,10 +1260,11 @@ query submissionDetails($submissionId: ID!) {
     },
     body: JSON.stringify(submissionDetailsQuery),
   };
-  const submissionDetailsResponse = await fetch(
-    `${getLeetCodeBaseUrl()}/graphql/`,
-    submissionDetailsOptions,
-  ).then(res => res.json());
+  const submissionDetailsResponse = isCN
+    ? await fetchJsonWithTimeout(`${getLeetCodeBaseUrl()}/graphql/`, submissionDetailsOptions)
+    : await fetch(`${getLeetCodeBaseUrl()}/graphql/`, submissionDetailsOptions).then(res =>
+        res.json(),
+      );
   if (submissionDetailsResponse.errors?.length) {
     throw new Error(submissionDetailsResponse.errors.map(error => error.message).join('; '));
   }
@@ -1197,10 +1297,14 @@ query submissionDetails($submissionId: ID!) {
   }
 
   if (!isCN || this.questionDetails?.titleSlug !== titleSlug) {
-    const questionDetailsResponse = await fetch(
-      getLeetCodeBaseUrl() + '/graphql/',
-      questionDetailsOptions,
-    ).then(res => res.json());
+    const questionDetailsResponse = isCN
+      ? await fetchJsonWithTimeout(
+          getLeetCodeBaseUrl() + '/graphql/',
+          questionDetailsOptions,
+        )
+      : await fetch(getLeetCodeBaseUrl() + '/graphql/', questionDetailsOptions).then(res =>
+          res.json(),
+        );
     if (questionDetailsResponse.errors?.length) {
       throw new Error(questionDetailsResponse.errors.map(error => error.message).join('; '));
     }
@@ -1299,22 +1403,57 @@ const formatSubmissionTimestamp = timestamp => {
 };
 
 LeetCodeV2.prototype.waitForCnSubmission = async function (submissionId) {
+  const pollingTimeoutMilliseconds = 120000;
+  const pollingDeadline = Date.now() + pollingTimeoutMilliseconds;
   let lastError;
-  for (let attempt = 0; attempt < 120; attempt += 1) {
+  let lastStatus;
+  let queryErrorCount = 0;
+  let attemptNumber = 0;
+  while (Date.now() < pollingDeadline) {
+    attemptNumber += 1;
+    if (attemptNumber === 1 || attemptNumber % 10 === 0) {
+      console.log(
+        `[LeetHub Training] querying submission ${submissionId}` +
+          (attemptNumber === 1 ? '' : ` (attempt ${attemptNumber})`),
+      );
+    }
+
     try {
       await this.init(submissionId);
+      const status = this.submissionData?.statusDisplay ?? 'unknown';
+      if (status !== lastStatus || attemptNumber % 10 === 0) {
+        console.log(`[LeetHub Training] submission ${submissionId} status: ${status}`);
+        lastStatus = status;
+      }
       if (isCnTerminalSubmission(this.submissionData)) {
+        console.log(`[LeetHub Training] terminal submission ${submissionId}: ${status}`);
         return;
       }
     } catch (error) {
       lastError = error;
+      queryErrorCount += 1;
+      if (queryErrorCount === 1 || queryErrorCount % 10 === 0) {
+        console.error(
+          `[LeetHub Training] query error for submission ${submissionId} ` +
+            `(attempt ${attemptNumber}): ${getErrorMessage(error)}`,
+          error,
+        );
+      }
     }
 
-    await wait(1000);
+    const remainingMilliseconds = pollingDeadline - Date.now();
+    if (remainingMilliseconds > 0) {
+      await wait(Math.min(1000, remainingMilliseconds));
+    }
   }
 
   const reason = lastError ? `: ${lastError.message}` : '';
-  throw new Error(`Timed out waiting for submission ${submissionId}${reason}`);
+  const timeoutError = new Error(`Timed out waiting for submission ${submissionId}${reason}`);
+  console.error(
+    `[LeetHub Training] final timeout for submission ${submissionId}: ${timeoutError.message}`,
+    timeoutError,
+  );
+  throw timeoutError;
 };
 
 LeetCodeV2.prototype.getCnAttemptMetadata = function (submissionId) {
@@ -1359,6 +1498,9 @@ LeetCodeV2.prototype.processCnSubmission = async function (submissionId, suffix)
   last_language = this.getLanguage();
 
   // Keep these sequential: both uploads update the same locally cached SHA map.
+  console.log(
+    `[LeetHub Training] uploading attempt code ${problemName}/${attemptPath}`,
+  );
   await uploadGit(
     btoa(unescape(encodeURIComponent(code))),
     problemName,
@@ -1367,6 +1509,7 @@ LeetCodeV2.prototype.processCnSubmission = async function (submissionId, suffix)
     'upload',
     false,
   );
+  console.log(`[LeetHub Training] uploading metadata ${problemName}/${metadataPath}`);
   await uploadGit(
     btoa(unescape(encodeURIComponent(metadata))),
     problemName,
@@ -1379,6 +1522,8 @@ LeetCodeV2.prototype.processCnSubmission = async function (submissionId, suffix)
   if (isAcceptedSubmission(this.submissionData)) {
     await uploadCanonicalSolution(this, suffix);
   }
+
+  console.log(`[LeetHub Training] upload complete ${submissionId}`);
 };
 
 LeetCodeV2.prototype.findAndUploadCode = function (
