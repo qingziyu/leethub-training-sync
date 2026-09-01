@@ -3,7 +3,20 @@ window.leetHubSolutionPosts = [];
 
 const detectedSubmissionIds = new Set();
 
-const notifySubmissionId = submissionId => {
+const captureCnTimerSnapshot = () => {
+  if (!window.location.hostname.endsWith('leetcode.cn')) {
+    return undefined;
+  }
+
+  try {
+    return globalThis.leetHubTimer?.captureSnapshot() ?? null;
+  } catch (error) {
+    console.error('[LeetHub Timer] unexpected timer capture failure', error);
+    return null;
+  }
+};
+
+const notifySubmissionId = (submissionId, timerSnapshot) => {
   if (submissionId == null) {
     return;
   }
@@ -17,7 +30,7 @@ const notifySubmissionId = submissionId => {
   globalThis.leetHubDebugLog('LeetHub: Submission ID detected', normalizedSubmissionId);
   window.dispatchEvent(
     new CustomEvent('leetHubSubmissionId', {
-      detail: { submissionId },
+      detail: { submissionId, timerSnapshot },
     }),
   );
 };
@@ -37,7 +50,7 @@ window.fetch = async function (...args) {
     try {
       const clonedResponse = response.clone();
       const data = await clonedResponse.json();
-      notifySubmissionId(data?.submission_id);
+      notifySubmissionId(data?.submission_id, captureCnTimerSnapshot());
     } catch (e) {
       console.error('LeetHub: Error parsing submission response', e);
     }
@@ -112,7 +125,7 @@ XMLHttpRequest.prototype.send = function (data) {
             typeof this.response === 'object' && this.response !== null
               ? this.response
               : JSON.parse(this.responseText || '{}');
-          notifySubmissionId(responseData?.submission_id);
+          notifySubmissionId(responseData?.submission_id, captureCnTimerSnapshot());
         } catch (error) {
           console.error('LeetHub: Error parsing XHR submission response', error);
         }

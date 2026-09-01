@@ -1038,7 +1038,17 @@ LeetCodeV1.prototype.markUploadFailed = function () {
 LeetCodeV2.prototype.injectAndListen = function () {
   window.addEventListener('leetHubSubmissionId', event => {
     globalThis.leetHubDebugLog('[LeetHub] Received submission ID:', event.detail.submissionId);
-    this.processSubmission(event.detail.submissionId);
+    let timerSnapshot = null;
+    try {
+      timerSnapshot = event.detail.timerSnapshot ?? null;
+    } catch (error) {
+      console.error('[LeetHub Timer] unexpected timer snapshot read failure', error);
+    }
+    this.processSubmission(
+      event.detail.submissionId,
+      undefined,
+      timerSnapshot,
+    );
   });
 
   window.addEventListener('leetHubSolutionPost', (event) => {
@@ -1051,7 +1061,11 @@ LeetCodeV2.prototype.injectAndListen = function () {
 /**
  * The main function that handles the entire commit process based on the submissionId.
  */
-LeetCodeV2.prototype.processSubmission = async function (submissionId, suffix) {
+LeetCodeV2.prototype.processSubmission = async function (
+  submissionId,
+  suffix,
+  timerSnapshot = null,
+) {
   let isCN;
   try {
     isCN = getLeetCodeBaseUrl() === 'https://leetcode.cn';
@@ -1093,6 +1107,8 @@ LeetCodeV2.prototype.processSubmission = async function (submissionId, suffix) {
     return;
   }
 
+  const ownedTimerSnapshot = copyCnTimerSnapshot(timerSnapshot);
+
   const recoveredQueue = Promise.resolve(this.submissionQueue).catch(error => {
     console.error(
       `[LeetHub Training] recovered rejected queue before submission ${normalizedSubmissionId}: ${getErrorMessage(error)}`,
@@ -1126,7 +1142,7 @@ LeetCodeV2.prototype.processSubmission = async function (submissionId, suffix) {
           `[LeetHub Training] started submission ${normalizedSubmissionId}`,
         );
         this.startSpinner();
-        await this.processCnSubmission(normalizedSubmissionId, suffix);
+        await this.processCnSubmission(normalizedSubmissionId, suffix, ownedTimerSnapshot);
         this.completedSubmissionIds.add(normalizedSubmissionId);
         this.markUploaded();
       } catch (error) {
@@ -1179,6 +1195,39 @@ const getErrorMessage = error => {
     return String(error);
   } catch {
     return 'Unknown error';
+  }
+};
+
+const copyCnTimerSnapshot = timerSnapshot => {
+  if (!timerSnapshot || typeof timerSnapshot !== 'object') {
+    return null;
+  }
+
+  try {
+    const snapshot = {
+      source: timerSnapshot.source,
+      targetSeconds: timerSnapshot.targetSeconds ?? null,
+      remainingSeconds: timerSnapshot.remainingSeconds,
+      elapsedSeconds: timerSnapshot.elapsedSeconds ?? null,
+      capturedAt: timerSnapshot.capturedAt,
+    };
+    const isOptionalSeconds = value =>
+      value === null || (Number.isSafeInteger(value) && value >= 0);
+    if (
+      snapshot.source !== 'leetcode.cn-native-countdown' ||
+      !Number.isSafeInteger(snapshot.remainingSeconds) ||
+      snapshot.remainingSeconds < 0 ||
+      !isOptionalSeconds(snapshot.targetSeconds) ||
+      !isOptionalSeconds(snapshot.elapsedSeconds) ||
+      typeof snapshot.capturedAt !== 'string'
+    ) {
+      return null;
+    }
+
+    return Object.freeze(snapshot);
+  } catch (error) {
+    console.error('[LeetHub Timer] unexpected timer snapshot copy failure', error);
+    return null;
   }
 };
 
@@ -1471,7 +1520,7 @@ LeetCodeV2.prototype.waitForCnSubmission = async function (submissionId) {
   throw timeoutError;
 };
 
-LeetCodeV2.prototype.getCnAttemptMetadata = function (submissionId) {
+LeetCodeV2.prototype.getCnAttemptMetadata = function (submissionId, timerSnapshot) {
   const outputDetail = this.submissionData.outputDetail ?? {};
   const titleSlug = this.submissionData.question?.titleSlug;
 
@@ -1490,13 +1539,18 @@ LeetCodeV2.prototype.getCnAttemptMetadata = function (submissionId) {
     actualOutput: outputDetail.codeOutput ?? null,
     compileError: outputDetail.compileError ?? null,
     runtimeError: outputDetail.runtimeError ?? this.submissionData.runtimeError ?? null,
+    timer: timerSnapshot ?? null,
     submissionUrl: titleSlug
       ? `${getLeetCodeBaseUrl()}/problems/${titleSlug}/submissions/${submissionId}/`
       : `${getLeetCodeBaseUrl()}/submissions/detail/${submissionId}/`,
   };
 };
 
-LeetCodeV2.prototype.processCnSubmission = async function (submissionId, suffix) {
+LeetCodeV2.prototype.processCnSubmission = async function (
+  submissionId,
+  suffix,
+  timerSnapshot,
+) {
   await this.waitForCnSubmission(submissionId);
 
   const problemName = this.getProblemNameSlug();
@@ -1507,7 +1561,11 @@ LeetCodeV2.prototype.processCnSubmission = async function (submissionId, suffix)
   const metadataPath = `attempts/${submissionId}.json`;
   const commitMessage = `Archive ${status} attempt ${submissionId}: ${problemName}`;
   const code = this.getCode() ?? '';
-  const metadata = `${JSON.stringify(this.getCnAttemptMetadata(submissionId), null, 2)}\n`;
+  const metadata = `${JSON.stringify(
+    this.getCnAttemptMetadata(submissionId, timerSnapshot),
+    null,
+    2,
+  )}\n`;
 
   difficulty = this.parseDifficulty();
   last_language = this.getLanguage();

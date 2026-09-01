@@ -30,6 +30,7 @@
       ],
       "js": [
         "src/js/debug.js",
+        "src/js/timer.js",
         "src/js/interceptor.js"
       ],
       "run_at": "document_start",
