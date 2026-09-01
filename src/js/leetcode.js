@@ -1319,6 +1319,7 @@ LeetCodeV2.prototype.waitForCnSubmission = async function (submissionId) {
 
 LeetCodeV2.prototype.getCnAttemptMetadata = function (submissionId) {
   const outputDetail = this.submissionData.outputDetail ?? {};
+  const titleSlug = this.submissionData.question?.titleSlug;
 
   return {
     submissionId: String(submissionId),
@@ -1335,7 +1336,9 @@ LeetCodeV2.prototype.getCnAttemptMetadata = function (submissionId) {
     actualOutput: outputDetail.codeOutput ?? null,
     compileError: outputDetail.compileError ?? null,
     runtimeError: outputDetail.runtimeError ?? this.submissionData.runtimeError ?? null,
-    submissionUrl: `${getLeetCodeBaseUrl()}/submissions/detail/${submissionId}/`,
+    submissionUrl: titleSlug
+      ? `${getLeetCodeBaseUrl()}/problems/${titleSlug}/submissions/${submissionId}/`
+      : `${getLeetCodeBaseUrl()}/submissions/detail/${submissionId}/`,
   };
 };
 
@@ -1633,7 +1636,7 @@ LeetCodeV2.prototype.addManualSubmitButton = function () {
   const uploadLatestSubmission = suffix => {
     if (getLeetCodeBaseUrl() === 'https://leetcode.cn') {
       const historicalSubmissionId = window.location.pathname.match(
-        /\/submissions\/detail\/(\d+)\/?/,
+        /(?:\/submissions\/detail\/|\/problems\/[^/]+\/submissions\/)(\d+)\/?/,
       )?.[1];
       const submissionId = historicalSubmissionId ?? window.leethubLastSubmissionId;
       if (!submissionId) {
