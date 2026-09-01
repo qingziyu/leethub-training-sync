@@ -160,7 +160,11 @@ const getCustomCommitMessage = problemContext => {
  * @param {Array} topicTags - The topic tags in which the @p problemName is to be added.
  * @param {string} problemName - The name of the problem to be added.
  */
-async function updateReadmeTopicTagsWithProblem(topicTags, problemName) {
+async function updateReadmeTopicTagsWithProblem(
+  topicTags,
+  problemName,
+  skipUnchanged = false,
+) {
   if (!topicTags) {
     globalThis.leetHubDebugLog('No topic tags provided');
     return;
@@ -212,11 +216,18 @@ async function updateReadmeTopicTagsWithProblem(topicTags, problemName) {
     }
   }
 
+  const existingReadme = readme;
   for (const topic of topicTags) {
     readme = await appendProblemToReadme(topic.name, readme, leethub_hook, problemName);
   }
 
   readme = sortTopicsInReadme(readme);
+  if (skipUnchanged && readme === existingReadme) {
+    globalThis.leetHubDebugLog(
+      `[LeetHub Training] repository README already contains ${problemName}`,
+    );
+    return;
+  }
 
   const encodedReadme = btoa(unescape(encodeURIComponent(readme)));
   try {
@@ -526,6 +537,80 @@ function uploadGit(
           )
         : undefined,
     );
+}
+
+async function uploadCnCanonicalFileIfChanged(
+  code,
+  problemName,
+  fileName,
+  commitMsg,
+  action,
+  shouldPrependDiscussionPosts = false,
+) {
+  const {
+    leethub_token: token,
+    leethub_hook: hook,
+    mode_type: modeType,
+    stats: storedStats,
+    useDifficultyFolder = false,
+    useLanguageFolder = false,
+  } = await chrome.storage.local.get([
+    'leethub_token',
+    'leethub_hook',
+    'mode_type',
+    'stats',
+    'useDifficultyFolder',
+    'useLanguageFolder',
+  ]);
+
+  if (storedStats?.shas?.[problemName]?.[fileName] === undefined) {
+    return uploadGit(
+      code,
+      problemName,
+      fileName,
+      commitMsg,
+      action,
+      shouldPrependDiscussionPosts,
+    );
+  }
+
+  if (token === undefined) {
+    throw new Error('leethub token is undefined');
+  }
+  if (modeType !== 'commit') {
+    throw new Error('leethub mode is not commit');
+  }
+  if (!hook) {
+    throw new Error('leethub hook not defined');
+  }
+
+  const currentFile = await getUpdatedData(
+    token,
+    hook,
+    problemName,
+    fileName,
+    useDifficultyFolder,
+    useLanguageFolder,
+  );
+  const currentContent = currentFile?.content?.replace(/\s/g, '');
+  if (currentFile?.sha && currentContent === code.replace(/\s/g, '')) {
+    const refreshedStats = await getAndInitializeStats(problemName);
+    refreshedStats.shas[problemName][fileName] = currentFile.sha;
+    await chrome.storage.local.set({ stats: refreshedStats });
+    globalThis.leetHubDebugLog(
+      `[LeetHub Training] canonical file unchanged ${problemName}/${fileName}`,
+    );
+    return;
+  }
+
+  return uploadGit(
+    code,
+    problemName,
+    fileName,
+    commitMsg,
+    action,
+    shouldPrependDiscussionPosts,
+  );
 }
 
 /* Gets updated GitHub data for the specific file in repo in question */
@@ -1930,6 +2015,7 @@ chrome.storage.local.get('isSync', data => {
 });
 
 const uploadCanonicalSolution = async (leetCode, suffix) => {
+  const isCN = getLeetCodeBaseUrl() === 'https://leetcode.cn';
   const probStats = leetCode.parseStats();
   if (!probStats) {
     throw new Error('Could not get submission stats');
@@ -1942,10 +2028,9 @@ const uploadCanonicalSolution = async (leetCode, suffix) => {
 
   const problemName = leetCode.getProblemNameSlug();
   const { stats } = await chrome.storage.local.get('stats');
-  const alreadyCompleted =
-    getLeetCodeBaseUrl() === 'https://leetcode.cn'
-      ? stats?.shas?.[problemName]?.['README.md'] !== undefined
-      : await checkAlreadyCompleted(problemName);
+  const alreadyCompleted = isCN
+    ? stats?.shas?.[problemName]?.['README.md'] !== undefined
+    : await checkAlreadyCompleted(problemName);
   const language = leetCode.getLanguageExtension();
   if (!language) {
     throw new Error('Could not find language');
@@ -1954,8 +2039,9 @@ const uploadCanonicalSolution = async (leetCode, suffix) => {
 
   /* Upload README */
   const shaExists = stats?.shas?.[problemName]?.['README.md'] !== undefined;
+  const uploadCanonicalFile = isCN ? uploadCnCanonicalFileIfChanged : uploadGit;
   const updateReadMe = !shaExists
-    ? await uploadGit(
+    ? await uploadCanonicalFile(
         btoa(unescape(encodeURIComponent(probStatement))),
         problemName,
         'README.md',
@@ -1968,7 +2054,7 @@ const uploadCanonicalSolution = async (leetCode, suffix) => {
   /* Upload Notes if any*/
   const notes = leetCode.getNotesIfAny();
   let updateNotes;
-  if (notes != undefined && notes.length > 0) {
+  if (!isCN && notes != undefined && notes.length > 0) {
     updateNotes = uploadGit(
       btoa(unescape(encodeURIComponent(notes))),
       problemName,
@@ -2004,20 +2090,52 @@ const uploadCanonicalSolution = async (leetCode, suffix) => {
     fileName = suffix ? `${problemName}${suffix}${language}` : `${problemName}${language}`;
   }
 
-  /* Upload code to Git */
-  const updateCode = leetCode.findAndUploadCode(problemName, fileName, commitMsg, 'upload');
-
-  /* Group problem into its relevant topics */
-  const updateRepoReadMe = updateReadmeTopicTagsWithProblem(
-    leetCode.questionDetails?.topicTags,
-    problemName,
-  );
-
-  await Promise.all([updateReadMe, updateNotes, updateCode, updateRepoReadMe]);
+  if (isCN) {
+    // Each Contents API write creates a commit on the same branch. Keep CN writes serial.
+    if (notes != undefined && notes.length > 0) {
+      await uploadCnCanonicalFileIfChanged(
+        btoa(unescape(encodeURIComponent(notes))),
+        problemName,
+        'NOTES.md',
+        `Attach Notes : ${problemName}`,
+        'upload',
+        false,
+      );
+    }
+    const code = leetCode.getCode();
+    if (!code) {
+      throw new Error('No solution code found');
+    }
+    await uploadCnCanonicalFileIfChanged(
+      btoa(unescape(encodeURIComponent(code))),
+      problemName,
+      fileName,
+      commitMsg,
+      'upload',
+      false,
+    );
+    await updateReadmeTopicTagsWithProblem(
+      leetCode.questionDetails?.topicTags,
+      problemName,
+      true,
+    );
+  } else {
+    const updateCode = leetCode.findAndUploadCode(
+      problemName,
+      fileName,
+      commitMsg,
+      'upload',
+    );
+    const updateRepoReadMe = updateReadmeTopicTagsWithProblem(
+      leetCode.questionDetails?.topicTags,
+      problemName,
+    );
+    await Promise.all([updateReadMe, updateNotes, updateCode, updateRepoReadMe]);
+  }
 
   if (!alreadyCompleted) {
     const statsUpdate = incrementStats();
-    if (getLeetCodeBaseUrl() === 'https://leetcode.cn') {
+    if (isCN) {
       await statsUpdate;
     }
   }
