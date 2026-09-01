@@ -29,6 +29,7 @@
         "https://github.com/*"
       ],
       "js": [
+        "src/js/debug.js",
         "src/js/interceptor.js"
       ],
       "run_at": "document_start",
@@ -41,6 +42,7 @@
         "https://github.com/*"
       ],
       "js": [
+        "src/js/debug.js",
         "src/js/leetcode.js",
         "src/js/authorize.js"
       ],
