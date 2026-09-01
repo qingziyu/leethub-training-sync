@@ -1,6 +1,27 @@
 // Store reference to solution posts for communication with content script
 window.leetHubSolutionPosts = [];
 
+const detectedSubmissionIds = new Set();
+
+const notifySubmissionId = submissionId => {
+  if (submissionId == null) {
+    return;
+  }
+
+  const normalizedSubmissionId = String(submissionId);
+  if (detectedSubmissionIds.has(normalizedSubmissionId)) {
+    return;
+  }
+
+  detectedSubmissionIds.add(normalizedSubmissionId);
+  console.log('LeetHub: Submission ID detected', normalizedSubmissionId);
+  window.dispatchEvent(
+    new CustomEvent('leetHubSubmissionId', {
+      detail: { submissionId },
+    }),
+  );
+};
+
 // 1. Intercept fetch requests
 const originalFetch = window.fetch;
 
@@ -16,15 +37,7 @@ window.fetch = async function (...args) {
     try {
       const clonedResponse = response.clone();
       const data = await clonedResponse.json();
-
-      if (data?.submission_id) {
-        console.log('LeetHub: Submission ID detected', data.submission_id);
-        window.dispatchEvent(
-          new CustomEvent('leetHubSubmissionId', {
-            detail: { submissionId: data.submission_id }
-          })
-        );
-      }
+      notifySubmissionId(data?.submission_id);
     } catch (e) {
       console.log('LeetHub: Error parsing submission response', e);
     }
@@ -82,6 +95,28 @@ XMLHttpRequest.prototype.open = function (method, url, ...args) {
 };
 
 XMLHttpRequest.prototype.send = function (data) {
+  if (
+    window.location.hostname.endsWith('leetcode.cn') &&
+    this._leethub_url?.includes('/problems/') &&
+    this._leethub_url?.includes('/submit/')
+  ) {
+    this.addEventListener(
+      'load',
+      () => {
+        try {
+          const responseData =
+            typeof this.response === 'object' && this.response !== null
+              ? this.response
+              : JSON.parse(this.responseText || '{}');
+          notifySubmissionId(responseData?.submission_id);
+        } catch (error) {
+          console.log('LeetHub: Error parsing XHR submission response', error);
+        }
+      },
+      { once: true },
+    );
+  }
+
   if (
     this._leethub_url?.includes('/graphql/') &&
     this._leethub_method === 'POST'

@@ -491,7 +491,10 @@ function uploadGit(
       }
     })
     .catch(err => {
-      if (err.message === '409') {
+      if (
+        err.message === '409' ||
+        (getLeetCodeBaseUrl() === 'https://leetcode.cn' && err.message === '422')
+      ) {
         return getUpdatedData(
           token,
           hook,
@@ -1030,7 +1033,7 @@ LeetCodeV1.prototype.markUploadFailed = function () {
  * and listens for messages from the injected script.
  */
 LeetCodeV2.prototype.injectAndListen = function () {
-  window.addEventListener('leetHubSubmissionId', (event) => {
+  window.addEventListener('leetHubSubmissionId', event => {
     console.log('[LeetHub] Received submission ID:', event.detail.submissionId);
     this.processSubmission(event.detail.submissionId);
   });
@@ -1045,28 +1048,59 @@ LeetCodeV2.prototype.injectAndListen = function () {
 /**
  * The main function that handles the entire commit process based on the submissionId.
  */
-LeetCodeV2.prototype.processSubmission = async function (submissionId) {
+LeetCodeV2.prototype.processSubmission = async function (submissionId, suffix) {
   // Set the submissionId as a global variable so the existing init function can use it.
   window.leethubLastSubmissionId = submissionId;
 
-  // Directly call the loader from the existing code.
-  loader(this);
+  if (getLeetCodeBaseUrl() !== 'https://leetcode.cn') {
+    // Keep the existing leetcode.com submission flow unchanged.
+    loader(this);
+    return;
+  }
+
+  const normalizedSubmissionId = String(submissionId);
+  if (
+    this.queuedSubmissionIds.has(normalizedSubmissionId) ||
+    this.completedSubmissionIds.has(normalizedSubmissionId)
+  ) {
+    return;
+  }
+
+  this.queuedSubmissionIds.add(normalizedSubmissionId);
+  this.submissionQueue = this.submissionQueue.then(async () => {
+    this.startSpinner();
+    try {
+      await this.processCnSubmission(normalizedSubmissionId, suffix);
+      this.completedSubmissionIds.add(normalizedSubmissionId);
+      this.markUploaded();
+    } catch (error) {
+      this.markUploadFailed();
+      console.error(`LeetHub: Failed to archive submission ${normalizedSubmissionId}`, error);
+    } finally {
+      this.queuedSubmissionIds.delete(normalizedSubmissionId);
+      uploadState.uploading = false;
+    }
+  });
+
+  return this.submissionQueue;
 };
 
 function LeetCodeV2() {
   this.submissionData;
+  this.questionDetails;
+  this.submissionQueue = Promise.resolve();
+  this.queuedSubmissionIds = new Set();
+  this.completedSubmissionIds = new Set();
   this.progressSpinnerElementId = 'leethub_progress_elem';
   this.progressSpinnerElementClass = 'leethub_progress';
   this.injectSpinnerStyle();
   this.addManualSubmitButton();
   this.injectAndListen();
 }
-LeetCodeV2.prototype.init = async function () {
-    const submissionId = window.leethubLastSubmissionId;
-    if (!submissionId) {
-      alert('Could not find a recent submission ID. Please try submitting again.');
-      return;
-    }
+LeetCodeV2.prototype.init = async function (submissionId = window.leethubLastSubmissionId) {
+  if (!submissionId) {
+    throw new Error('Could not find a recent submission ID. Please try submitting again.');
+  }
   // Query for getting the solution runtime and memory stats, the code, the coding language, the question id, question title and question difficulty
   const isCN = getLeetCodeBaseUrl() === 'https://leetcode.cn';
   const submissionDetailsQuery = {
@@ -1127,12 +1161,19 @@ query submissionDetails($submissionId: ID!) {
     },
     body: JSON.stringify(submissionDetailsQuery),
   };
-  const submissionDetailsData = await fetch(
+  const submissionDetailsResponse = await fetch(
     `${getLeetCodeBaseUrl()}/graphql/`,
     submissionDetailsOptions,
-  )
-    .then(res => res.json())
-    .then(res => (isCN ? res.data.submissionDetail : res.data.submissionDetails));
+  ).then(res => res.json());
+  if (submissionDetailsResponse.errors?.length) {
+    throw new Error(submissionDetailsResponse.errors.map(error => error.message).join('; '));
+  }
+  const submissionDetailsData = isCN
+    ? submissionDetailsResponse.data?.submissionDetail
+    : submissionDetailsResponse.data?.submissionDetails;
+  if (!submissionDetailsData) {
+    throw new Error(`Submission ${submissionId} is not available yet`);
+  }
   console.info('LeetHub:', { submissionDetailsData });
   this.submissionData = submissionDetailsData;
 
@@ -1150,14 +1191,193 @@ query submissionDetails($submissionId: ID!) {
     },
     body: JSON.stringify(questionDetailsQuery),
   };
-  const questionDetailsData = await fetch(
-    getLeetCodeBaseUrl() + '/graphql/',
-    questionDetailsOptions,
-  )
-    .then(res => res.json())
-    .then(res => res.data.question);
-  this.questionDetails = questionDetailsData;
+  const titleSlug = this.submissionData.question?.titleSlug;
+  if (!titleSlug) {
+    throw new Error(`Submission ${submissionId} did not include a problem slug`);
+  }
+
+  if (!isCN || this.questionDetails?.titleSlug !== titleSlug) {
+    const questionDetailsResponse = await fetch(
+      getLeetCodeBaseUrl() + '/graphql/',
+      questionDetailsOptions,
+    ).then(res => res.json());
+    if (questionDetailsResponse.errors?.length) {
+      throw new Error(questionDetailsResponse.errors.map(error => error.message).join('; '));
+    }
+    this.questionDetails = questionDetailsResponse.data?.question;
+  }
+
+  if (!this.questionDetails) {
+    throw new Error(`Problem metadata for ${titleSlug} is not available`);
+  }
+
+  if (isCN) {
+    this.submissionData.question = {
+      ...this.submissionData.question,
+      questionFrontendId:
+        this.questionDetails.questionFrontendId ?? this.submissionData.question.questionId,
+      title: this.questionDetails.translatedTitle || this.questionDetails.title,
+      content: this.questionDetails.translatedContent || this.questionDetails.content,
+      difficulty: this.questionDetails.difficulty,
+    };
+  }
 };
+
+const cnPendingSubmissionStatuses = new Set([
+  'pending',
+  'queued',
+  'queueing',
+  'started',
+  'starting',
+  'submitted',
+  'judging',
+  'checking',
+  'processing',
+  'running',
+  'unknown',
+  '等待中',
+  '待判题',
+  '判题中',
+  '处理中',
+  '运行中',
+  '未知',
+]);
+
+const cnStatusFilenameAliases = {
+  accepted: 'Accepted',
+  'compile error': 'Compile-Error',
+  'memory limit exceeded': 'Memory-Limit-Exceeded',
+  'output limit exceeded': 'Output-Limit-Exceeded',
+  'runtime error': 'Runtime-Error',
+  'time limit exceeded': 'Time-Limit-Exceeded',
+  'wrong answer': 'Wrong-Answer',
+  编译出错: 'Compile-Error',
+  通过: 'Accepted',
+  超出内存限制: 'Memory-Limit-Exceeded',
+  超出时间限制: 'Time-Limit-Exceeded',
+  解答错误: 'Wrong-Answer',
+  执行出错: 'Runtime-Error',
+};
+
+const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+const isCnTerminalSubmission = submissionData => {
+  const status = submissionData?.statusDisplay?.trim();
+  return Boolean(status) && !cnPendingSubmissionStatuses.has(status.toLowerCase());
+};
+
+const isAcceptedSubmission = submissionData => {
+  const status = submissionData?.statusDisplay?.trim().toLowerCase();
+  return status === 'accepted' || status === '通过';
+};
+
+const getCnStatusFilename = status => {
+  const normalizedStatus = String(status || 'Unknown Status').trim();
+  const alias = cnStatusFilenameAliases[normalizedStatus.toLowerCase()];
+  if (alias) {
+    return alias;
+  }
+
+  return normalizedStatus
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'Unknown-Status';
+};
+
+const formatSubmissionTimestamp = timestamp => {
+  if (timestamp == null || timestamp === '') {
+    return null;
+  }
+
+  const numericTimestamp = Number(timestamp);
+  if (!Number.isFinite(numericTimestamp)) {
+    return String(timestamp);
+  }
+
+  const milliseconds = numericTimestamp < 1e12 ? numericTimestamp * 1000 : numericTimestamp;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? String(timestamp) : date.toISOString();
+};
+
+LeetCodeV2.prototype.waitForCnSubmission = async function (submissionId) {
+  let lastError;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    try {
+      await this.init(submissionId);
+      if (isCnTerminalSubmission(this.submissionData)) {
+        return;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await wait(1000);
+  }
+
+  const reason = lastError ? `: ${lastError.message}` : '';
+  throw new Error(`Timed out waiting for submission ${submissionId}${reason}`);
+};
+
+LeetCodeV2.prototype.getCnAttemptMetadata = function (submissionId) {
+  const outputDetail = this.submissionData.outputDetail ?? {};
+
+  return {
+    submissionId: String(submissionId),
+    status: this.submissionData.statusDisplay ?? null,
+    timestamp: formatSubmissionTimestamp(this.submissionData.timestamp),
+    language: this.getLanguage() || this.submissionData.lang || null,
+    runtime: this.submissionData.runtimeDisplay ?? null,
+    memory: this.submissionData.memoryDisplay ?? this.submissionData.memory ?? null,
+    passedTestCases: this.submissionData.passedTestCaseCnt ?? null,
+    totalTestCases: this.submissionData.totalTestCaseCnt ?? null,
+    failedTestcase: outputDetail.lastTestcase ?? null,
+    input: outputDetail.input ?? null,
+    expectedOutput: outputDetail.expectedOutput ?? null,
+    actualOutput: outputDetail.codeOutput ?? null,
+    compileError: outputDetail.compileError ?? null,
+    runtimeError: outputDetail.runtimeError ?? this.submissionData.runtimeError ?? null,
+    submissionUrl: `${getLeetCodeBaseUrl()}/submissions/detail/${submissionId}/`,
+  };
+};
+
+LeetCodeV2.prototype.processCnSubmission = async function (submissionId, suffix) {
+  await this.waitForCnSubmission(submissionId);
+
+  const problemName = this.getProblemNameSlug();
+  const languageExtension = this.getLanguageExtension() || '.txt';
+  const status = this.submissionData.statusDisplay ?? 'Unknown Status';
+  const statusFilename = getCnStatusFilename(status);
+  const attemptPath = `attempts/${submissionId}-${statusFilename}${languageExtension}`;
+  const metadataPath = `attempts/${submissionId}.json`;
+  const commitMessage = `Archive ${status} attempt ${submissionId}: ${problemName}`;
+  const code = this.getCode() ?? '';
+  const metadata = `${JSON.stringify(this.getCnAttemptMetadata(submissionId), null, 2)}\n`;
+
+  difficulty = this.parseDifficulty();
+  last_language = this.getLanguage();
+
+  // Keep these sequential: both uploads update the same locally cached SHA map.
+  await uploadGit(
+    btoa(unescape(encodeURIComponent(code))),
+    problemName,
+    attemptPath,
+    commitMessage,
+    'upload',
+    false,
+  );
+  await uploadGit(
+    btoa(unescape(encodeURIComponent(metadata))),
+    problemName,
+    metadataPath,
+    commitMessage,
+    'upload',
+    false,
+  );
+
+  if (isAcceptedSubmission(this.submissionData)) {
+    await uploadCanonicalSolution(this, suffix);
+  }
+};
+
 LeetCodeV2.prototype.findAndUploadCode = function (
   problemName,
   fileName,
@@ -1194,7 +1414,11 @@ LeetCodeV2.prototype.getCode = function () {
 };
 LeetCodeV2.prototype.getLanguageExtension = function () {
   if (this.submissionData != null) {
-    return languages[this.submissionData.lang.verboseName ?? this.submissionData.langVerboseName];
+    const languageName =
+      this.submissionData.lang?.verboseName ??
+      this.submissionData.langVerboseName ??
+      this.submissionData.lang;
+    return languages[languageName];
   }
 
   const tag = document.querySelector('button[id^="headlessui-listbox-button"]');
@@ -1211,7 +1435,7 @@ LeetCodeV2.prototype.getLanguageExtension = function () {
 };
 LeetCodeV2.prototype.getLanguage = function () {
   if (this.submissionData != null) {
-    return this.submissionData.lang.verboseName;
+    return this.submissionData.lang?.verboseName ?? this.submissionData.langVerboseName ?? '';
   }
   return '';
 };
@@ -1243,10 +1467,15 @@ LeetCodeV2.prototype.getSuccessStateAndUpdate = function () {
 };
 LeetCodeV2.prototype.parseStats = function () {
   if (this.submissionData != null) {
+    const isCN = getLeetCodeBaseUrl() === 'https://leetcode.cn';
     const runtimePercentile =
-      Math.round((this.submissionData.runtimePercentile + Number.EPSILON) * 100) / 100;
+      isCN && !Number.isFinite(this.submissionData.runtimePercentile)
+        ? 0
+        : Math.round((this.submissionData.runtimePercentile + Number.EPSILON) * 100) / 100;
     const spacePercentile =
-      Math.round((this.submissionData.memoryPercentile + Number.EPSILON) * 100) / 100;
+      isCN && !Number.isFinite(this.submissionData.memoryPercentile)
+        ? 0
+        : Math.round((this.submissionData.memoryPercentile + Number.EPSILON) * 100) / 100;
     return {
       time: this.submissionData.runtimeDisplay,
       timePercentile: runtimePercentile,
@@ -1273,7 +1502,10 @@ LeetCodeV2.prototype.parseStats = function () {
 LeetCodeV2.prototype.parseQuestion = function () {
   let markdown;
   if (this.submissionData != null) {
-    const questionUrl = window.location.href.split('/submissions')[0];
+    const questionUrl =
+      getLeetCodeBaseUrl() === 'https://leetcode.cn'
+        ? `${getLeetCodeBaseUrl()}/problems/${this.submissionData.question.titleSlug}/`
+        : window.location.href.split('/submissions')[0];
     const qTitle = `${this.extractQuestionNumber()}. ${this.submissionData.question.title}`;
     const qBody = this.parseQuestionDescription();
 
@@ -1398,14 +1630,29 @@ LeetCodeV2.prototype.addManualSubmitButton = function () {
   submitButton.textContent = 'Push ';
   submitButton.appendChild(getGitIcon());
   submitButton.appendChild(getToolTip());
-  submitButton.addEventListener('click', () => loader(this));
+  const uploadLatestSubmission = suffix => {
+    if (getLeetCodeBaseUrl() === 'https://leetcode.cn') {
+      const historicalSubmissionId = window.location.pathname.match(
+        /\/submissions\/detail\/(\d+)\/?/,
+      )?.[1];
+      const submissionId = historicalSubmissionId ?? window.leethubLastSubmissionId;
+      if (!submissionId) {
+        alert('Could not find a recent submission ID. Please try submitting again.');
+        return;
+      }
+      this.processSubmission(submissionId, suffix);
+      return;
+    }
+    loader(this, suffix);
+  };
+  submitButton.addEventListener('click', () => uploadLatestSubmission());
   submitButton.addEventListener('contextmenu', event => {
     event.preventDefault();
     const suffix = prompt(
       'Add a suffix for this solution file, i.e., -bfs, -dfs. \r\nWe don\'recommend includes special character except for "-".',
     );
     if (isValidSuffix(suffix)) {
-      loader(this, suffix);
+      uploadLatestSubmission(suffix);
     }
   });
 
@@ -1459,6 +1706,100 @@ chrome.storage.local.get('isSync', data => {
   }
 });
 
+const uploadCanonicalSolution = async (leetCode, suffix) => {
+  const probStats = leetCode.parseStats();
+  if (!probStats) {
+    throw new Error('Could not get submission stats');
+  }
+
+  const probStatement = leetCode.parseQuestion();
+  if (!probStatement) {
+    throw new Error('Could not find problem statement');
+  }
+
+  const problemName = leetCode.getProblemNameSlug();
+  const { stats } = await chrome.storage.local.get('stats');
+  const alreadyCompleted =
+    getLeetCodeBaseUrl() === 'https://leetcode.cn'
+      ? stats?.shas?.[problemName]?.['README.md'] !== undefined
+      : await checkAlreadyCompleted(problemName);
+  const language = leetCode.getLanguageExtension();
+  if (!language) {
+    throw new Error('Could not find language');
+  }
+  last_language = leetCode.getLanguage();
+
+  /* Upload README */
+  const shaExists = stats?.shas?.[problemName]?.['README.md'] !== undefined;
+  const updateReadMe = !shaExists
+    ? await uploadGit(
+        btoa(unescape(encodeURIComponent(probStatement))),
+        problemName,
+        'README.md',
+        `Create readme : ${problemName}`,
+        'upload',
+        false,
+      )
+    : undefined;
+
+  /* Upload Notes if any*/
+  const notes = leetCode.getNotesIfAny();
+  let updateNotes;
+  if (notes != undefined && notes.length > 0) {
+    updateNotes = uploadGit(
+      btoa(unescape(encodeURIComponent(notes))),
+      problemName,
+      'NOTES.md',
+      `Attach Notes : ${problemName}`,
+      'upload',
+      false,
+    );
+  }
+
+  const problemContext = {
+    time: `${probStats.time} (${probStats.timePercentile}%)`,
+    space: `${probStats.space} (${probStats.spacePercentile}%)`,
+    language: language,
+    problemName: problemName,
+    difficulty: difficulty,
+    date: getTodaysDate(),
+    problemTopic: probStats.problemTopic,
+  };
+  const probStatsCommitMsg = `Time: ${probStats.time} (${probStats.timePercentile}%), Space: ${probStats.space} (${probStats.spacePercentile}%) - LeetHub`;
+  const commitMsg = (await getCustomCommitMessage(problemContext)) || probStatsCommitMsg;
+
+  const { useTimestampFilename = false } =
+    await chrome.storage.local.get('useTimestampFilename');
+
+  let fileName;
+  if (useTimestampFilename) {
+    const timestamp = `${getTodaysDate()}-${getTime()}`.replace(/[:\s]/g, '--');
+    fileName = suffix
+      ? `${problemName}${suffix}-${timestamp}${language}`
+      : `${problemName}-${timestamp}${language}`;
+  } else {
+    fileName = suffix ? `${problemName}${suffix}${language}` : `${problemName}${language}`;
+  }
+
+  /* Upload code to Git */
+  const updateCode = leetCode.findAndUploadCode(problemName, fileName, commitMsg, 'upload');
+
+  /* Group problem into its relevant topics */
+  const updateRepoReadMe = updateReadmeTopicTagsWithProblem(
+    leetCode.questionDetails?.topicTags,
+    problemName,
+  );
+
+  await Promise.all([updateReadMe, updateNotes, updateCode, updateRepoReadMe]);
+
+  if (!alreadyCompleted) {
+    const statsUpdate = incrementStats();
+    if (getLeetCodeBaseUrl() === 'https://leetcode.cn') {
+      await statsUpdate;
+    }
+  }
+};
+
 const loader = (leetCode, suffix) => {
   let iterations = 0;
   // start upload indicator here
@@ -1480,97 +1821,10 @@ const loader = (leetCode, suffix) => {
 
       // For v2, query LeetCode API for submission results
       await leetCode.init();
-
-      const probStats = leetCode.parseStats();
-      if (!probStats) {
-        throw new Error('Could not get submission stats');
-      }
-
-      const probStatement = leetCode.parseQuestion();
-      if (!probStatement) {
-        throw new Error('Could not find problem statement');
-      }
-
-      const problemName = leetCode.getProblemNameSlug();
-      const alreadyCompleted = await checkAlreadyCompleted(problemName);
-      const language = leetCode.getLanguageExtension();
-      if (!language) {
-        throw new Error('Could not find language');
-      }
-      last_language = leetCode.getLanguage();
-      
-      /* Upload README */
-      const updateReadMe = await chrome.storage.local.get('stats').then(({ stats }) => {
-        const shaExists = stats?.shas?.[problemName]?.['README.md'] !== undefined;
-
-        if (!shaExists) {
-          return uploadGit(
-            btoa(unescape(encodeURIComponent(probStatement))),
-            problemName,
-            'README.md',
-            `Create readme : ${problemName}`,
-            'upload',
-            false,
-          );
-        }
-      });
-
-      /* Upload Notes if any*/
-      let notes = leetCode.getNotesIfAny();
-      let updateNotes;
-      if (notes != undefined && notes.length > 0) {
-        updateNotes = uploadGit(
-          btoa(unescape(encodeURIComponent(notes))),
-          problemName,
-          'NOTES.md',
-          `Attach Notes : ${problemName}`,
-          'upload',
-          false,
-        );
-      }
-
-      const problemContext = {
-        time: `${probStats.time} (${probStats.timePercentile}%)`,
-        space: `${probStats.space} (${probStats.spacePercentile}%)`,
-        language: language,
-        problemName: problemName,
-        difficulty: difficulty,
-        date: getTodaysDate(),
-        problemTopic: probStats.problemTopic,
-      };
-      const probStatsCommitMsg = `Time: ${probStats.time} (${probStats.timePercentile}%), Space: ${probStats.space} (${probStats.spacePercentile}%) - LeetHub`; // default commit
-      const commitMsg = (await getCustomCommitMessage(problemContext)) || probStatsCommitMsg;
-
-      const { useTimestampFilename = false } =
-        await chrome.storage.local.get('useTimestampFilename');
-
-      let fileName;
-      if (useTimestampFilename) {
-        const timestamp = `${getTodaysDate()}-${getTime()}`.replace(/[:\s]/g, '--');
-        fileName = suffix
-          ? `${problemName}${suffix}-${timestamp}${language}`
-          : `${problemName}-${timestamp}${language}`;
-      } else {
-        fileName = suffix ? `${problemName}${suffix}${language}` : `${problemName}${language}`;
-      }
-
-      /* Upload code to Git */
-      const updateCode = leetCode.findAndUploadCode(problemName, fileName, commitMsg, 'upload');
-
-      /* Group problem into its relevant topics */
-      const updateRepoReadMe = updateReadmeTopicTagsWithProblem(
-        leetCode.questionDetails?.topicTags,
-        problemName
-      );
-
-      await Promise.all([updateReadMe, updateNotes, updateCode, updateRepoReadMe]);
+      await uploadCanonicalSolution(leetCode, suffix);
 
       uploadState.uploading = false;
       leetCode.markUploaded();
-
-      if (!alreadyCompleted) {
-        incrementStats();
-      }
     } catch (err) {
       uploadState.uploading = false;
       leetCode.markUploadFailed();
