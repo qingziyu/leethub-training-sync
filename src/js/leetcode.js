@@ -274,6 +274,10 @@ async function updateReadmeTopicTagsWithProblem(
 }
 
 /* Main function for uploading code to GitHub repo, and callback cb is called if success */
+const isCnRecoverableGitHubError = error =>
+  getLeetCodeBaseUrl() === 'https://leetcode.cn' &&
+  (error?.message === '409' || error?.message === '422');
+
 const upload = (
   token,
   hook,
@@ -321,8 +325,15 @@ const upload = (
       if (res.status === 200 || res.status === 201) {
         return res.json();
       }
-      console.error(`GitHub upload failed for ${filename} with status ${res.status}`);
-      throw new Error(res.status);
+      const uploadError = new Error(res.status);
+      if (isCnRecoverableGitHubError(uploadError)) {
+        globalThis.leetHubDebugLog(
+          `Recoverable GitHub upload conflict for ${filename}: ${res.status}`,
+        );
+      } else {
+        console.error(`GitHub upload failed for ${filename} with status ${res.status}`);
+      }
+      throw uploadError;
     })
     .then(async body => {
       updatedSha = body.content.sha; // get updated SHA.
@@ -441,6 +452,7 @@ function uploadGit(
   let hook;
   let useDifficultyFolder = false;
   let useLanguageFolder = false;
+  let recoveringConflict = false;
 
   return chrome.storage.local
     .get('leethub_token')
@@ -509,6 +521,10 @@ function uploadGit(
         err.message === '409' ||
         (getLeetCodeBaseUrl() === 'https://leetcode.cn' && err.message === '422')
       ) {
+        recoveringConflict = true;
+        globalThis.leetHubDebugLog(
+          `Retrying GitHub upload for ${fileName} with the latest SHA`,
+        );
         return getUpdatedData(
           token,
           hook,
@@ -536,7 +552,13 @@ function uploadGit(
             useLanguageFolder,
           )
         : undefined,
-    );
+    )
+    .catch(error => {
+      if (recoveringConflict && isCnRecoverableGitHubError(error)) {
+        console.error(`GitHub upload failed for ${fileName} after conflict recovery`, error);
+      }
+      throw error;
+    });
 }
 
 async function uploadCnCanonicalFileIfChanged(
@@ -601,6 +623,52 @@ async function uploadCnCanonicalFileIfChanged(
       `[LeetHub Training] canonical file unchanged ${problemName}/${fileName}`,
     );
     return;
+  }
+
+  if (currentFile?.sha && action === 'upload') {
+    const uploadWithSha = sha =>
+      upload(
+        token,
+        hook,
+        code,
+        problemName,
+        fileName,
+        sha,
+        commitMsg,
+        undefined,
+        useDifficultyFolder,
+        useLanguageFolder,
+      );
+
+    try {
+      return await uploadWithSha(currentFile.sha);
+    } catch (error) {
+      if (!isCnRecoverableGitHubError(error)) {
+        throw error;
+      }
+      globalThis.leetHubDebugLog(
+        `Retrying CN canonical upload for ${problemName}/${fileName} with the latest SHA`,
+      );
+      const latestFile = await getUpdatedData(
+        token,
+        hook,
+        problemName,
+        fileName,
+        useDifficultyFolder,
+        useLanguageFolder,
+      );
+      try {
+        return await uploadWithSha(latestFile.sha);
+      } catch (retryError) {
+        if (isCnRecoverableGitHubError(retryError)) {
+          console.error(
+            `GitHub upload failed for ${fileName} after conflict recovery`,
+            retryError,
+          );
+        }
+        throw retryError;
+      }
+    }
   }
 
   return uploadGit(
