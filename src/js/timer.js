@@ -192,9 +192,12 @@
       if (!action) {
         return;
       }
-      const remainingSeconds = readAssociatedTimerSeconds(timerControl);
-      if (remainingSeconds === null) {
-        return;
+      let remainingSeconds = null;
+      if (action !== 'reset') {
+        remainingSeconds = readAssociatedTimerSeconds(timerControl);
+        if (remainingSeconds === null) {
+          return;
+        }
       }
 
       const targetSeconds = sessionTracker.observeAction(

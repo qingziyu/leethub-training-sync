@@ -29,7 +29,7 @@ assert.deepEqual(session.createSnapshot(720, capturedAt, 'two-sum'), {
   capturedAt,
 });
 
-session.observeAction('reset', 720, 'two-sum');
+session.observeAction('reset', null, 'two-sum');
 assert.equal(session.getTargetSeconds(), null);
 session.observeAction('start', 300, 'two-sum');
 assert.equal(session.getTargetSeconds(), 300);
